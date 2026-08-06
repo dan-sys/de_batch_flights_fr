@@ -1,0 +1,11 @@
+[project]
+name = "de-batch-flights-fr"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "dotenv>=0.9.9",
+    "polars>=1.43.2",
+    "requests>=2.34.2",
+]

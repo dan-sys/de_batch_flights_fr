@@ -15,25 +15,27 @@ services:
       - lab-network
 
   aflw:
-      container_name: airflow_container
-      image: apache/airflow:3.0.0
-      #build: .
-      ports:
-        - 8000:8080
-      environment:
-        AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow_pass@db:5432/airflow_db
-        AIRFLOW__DATABASE__LOAD_EXAMPLES: 'false'
-      volumes:
-        - ./airflow/dags:/opt/airflow/dags
-        - ./airflow/data:/opt/airflow/data
-        - ./airflow/logs:/opt/airflow/logs
-        - ./airflow/plugins:/opt/airflow/plugins
-      depends_on:
-        - db
-      command: > 
-        bash -c "airflow db migrate && airflow standalone"
-      networks:
-        - lab-network
+    container_name: airflow_container
+    env_file:
+      - .env
+    build: .
+    ports:
+    - 8000:8080
+    environment:
+      AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow_user:airflow_pass@db:5432/airflow_db
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/data:/opt/airflow/data
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./TokenManager.py:/opt/airflow/dags/TokenManager.py
+    depends_on:
+      - db
+    command: > 
+      bash -c "airflow db migrate && airflow standalone"
+    networks:
+      - lab-network
 
 
 networks:

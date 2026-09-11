@@ -1,0 +1,8 @@
+python-dotenv
+pendulum==3.2.0
+polars==1.43.2
+requests==2.34.2
+psycopg2-binary
+apache-airflow==3.0.0
+apache-airflow-providers-postgres==5.0.0
+adbc-driver-postgresql==1.10.0

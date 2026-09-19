@@ -89,6 +89,8 @@ def pipeline_taskflow():
         import psycopg2
         import polars as pl
 
+        conn = None
+        cur = None
         try:
             conn = psycopg2.connect(
                 host="db",
@@ -115,13 +117,13 @@ def pipeline_taskflow():
                     "estArrivalAirportHorizDistance" INT,
                     "estArrivalAirportVertDistance" INT,
                     "departureAirportCandidatesCount" INT,
-                    "arrivalAirportCandidatesCount" INT
+                    "arrivalAirportCandidatesCount" INT,
                     PRIMARY KEY ("icao24","firstSeen")
                 );
             """)
 
             insert_sql = """
-            INSERT INTO opensky_flights (
+            INSERT INTO dev.raw_arrivals (
                 "icao24",
                 "firstSeen",
                 "estDepartureAirport",
@@ -180,15 +182,123 @@ def pipeline_taskflow():
             print(f"Connection to PostgreSQL database failed: {e}")
             raise
         finally:
-            if conn:
+            if cur:
                 cur.close()
+            if conn:
                 conn.close()
                 print("PostgreSQL connection closed.")
-        
+
+    def load_departure_data(departures_all: list[dict]) -> None:
+        import psycopg2
+
+        conn = None
+        cur = None
+        try:
+            conn = psycopg2.connect(
+                host="db",
+                port=5432,
+                dbname="db_flights",
+                user="db_user",
+                password="db_password"
+            )
+            cur = conn.cursor()
+
+            # Create tables if they don't exist
+            cur.execute("""
+                CREATE SCHEMA IF NOT EXISTS dev;
+                CREATE TABLE IF NOT EXISTS dev.raw_departures (
+                    "icao24" TEXT,
+                    "firstSeen" BIGINT,
+                    "estDepartureAirport" TEXT,
+                    "lastSeen" BIGINT,
+                    "estArrivalAirport" TEXT,
+                    "callsign" TEXT,
+                    "estDepartureAirportHorizDistance" INT,
+                    "estDepartureAirportVertDistance" INT,
+                    "estArrivalAirportHorizDistance" INT,
+                    "estArrivalAirportVertDistance" INT,
+                    "departureAirportCandidatesCount" INT,
+                    "arrivalAirportCandidatesCount" INT,
+                    PRIMARY KEY ("icao24","firstSeen")
+                );
+            """)
+
+            insert_sql = """
+            INSERT INTO dev.raw_departures (
+                "icao24",
+                "firstSeen",
+                "estDepartureAirport",
+                "lastSeen",
+                "estArrivalAirport",
+                "callsign",
+                "estDepartureAirportHorizDistance",
+                "estDepartureAirportVertDistance",
+                "estArrivalAirportHorizDistance",
+                "estArrivalAirportVertDistance",
+                "departureAirportCandidatesCount",
+                "arrivalAirportCandidatesCount"
+            ) VALUES (
+                %(icao24)s,
+                %(firstSeen)s,
+                %(estDepartureAirport)s,
+                %(lastSeen)s,
+                %(estArrivalAirport)s,
+                %(callsign)s,
+                %(estDepartureAirportHorizDistance)s,
+                %(estDepartureAirportVertDistance)s,
+                %(estArrivalAirportHorizDistance)s,
+                %(estArrivalAirportVertDistance)s,
+                %(departureAirportCandidatesCount)s,
+                %(arrivalAirportCandidatesCount)s
+            )
+            ON CONFLICT ("icao24","firstSeen") DO UPDATE SET
+            "lastSeen" = EXCLUDED."lastSeen",
+            "estArrivalAirport" = EXCLUDED."estArrivalAirport",
+            "estArrivalAirportHorizDistance" = EXCLUDED."estArrivalAirportHorizDistance",
+            "estArrivalAirportVertDistance" = EXCLUDED."estArrivalAirportVertDistance";
+            """
+            for item in departures_all:
+                params = {
+                    "icao24": item.get("icao24"),
+                    "firstSeen": item.get("firstSeen"),
+                    "estDepartureAirport": item.get("estDepartureAirport"),
+                    "lastSeen": item.get("lastSeen"),
+                    "estArrivalAirport": item.get("estArrivalAirport"),
+                    "callsign": item.get("callsign", "").strip() if item.get("callsign") else None,
+                    "estDepartureAirportHorizDistance": item.get("estDepartureAirportHorizDistance"),
+                    "estDepartureAirportVertDistance": item.get("estDepartureAirportVertDistance"),
+                    "estArrivalAirportHorizDistance": item.get("estArrivalAirportHorizDistance"),
+                    "estArrivalAirportVertDistance": item.get("estArrivalAirportVertDistance"),
+                    "departureAirportCandidatesCount": item.get("departureAirportCandidatesCount"),
+                    "arrivalAirportCandidatesCount": item.get("arrivalAirportCandidatesCount"),
+                }
+                cur.execute(insert_sql, params)
+
+            # Commit the changes and close the cursor
+            conn.commit()
+            print("Departure RawTables created  and inserted records successfully.")
+            cur.close()            
+        except psycopg2.Error as e:
+            print(f"Connection to PostgreSQL database failed: {e}")
+            raise
+        finally:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+                print("PostgreSQL connection closed.")            
+                
+
+
+        pass # Implement the logic to load departure data into the database    
             
     #arrivals_all = extract_arrival_data_api(airports, startTime, endTime)
     #departures_all = extract_departure_data_api(airports, startTime, endTime)
-    airports = ["LFPG","LFPO","LFMN","LFLL","LFBO"]
+    airports = ["LFPG"]
+    # "LFPO", "LFBO", "LFLL", "LFML", "LFMN", "LFMT", 
+    # "LFMV", "LFBD", "LFBD", "LFBZ", "LFBH", "LFBK", "LFBL", 
+    # "LFBM", "LFBN", "LFBO", "LFBP", "LFBQ", "LFBR", "LFBS", 
+    # "LFBT", "LFBU", "LFBV", "LFBW", "LFBX", "LFBY"]
         
     prev_day = pendulum.yesterday('Europe/Paris')
     prev_day_end = prev_day.end_of('day')
@@ -199,9 +309,11 @@ def pipeline_taskflow():
     arrivals = extract_arrival_data_api(airports, startTime, endTime)
     departures = extract_departure_data_api(airports, startTime, endTime)
 
-    #load_arrival_data(arrivals_all=arrivals)  # type: ignore[arg-type]
-    #load_departure_data(departures_all=departures)  # type: ignore[arg-type]
+    load_arrival_data(arrivals_all=arrivals)  # type: ignore[arg-type]
+
+    load_departure_data(departures_all=departures)  # type: ignore[arg-type]
     # Equivalent dependency chain:
+
 
 pipeline_taskflow()
 

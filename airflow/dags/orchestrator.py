@@ -61,6 +61,8 @@ def pipeline_taskflow():
             else:
                 print(f"Error fetching data for airport {airport}: {r.status_code} - {r.text}")
 
+            time.sleep(3)
+            
         return arrivals_all
     
     @task()
@@ -78,6 +80,8 @@ def pipeline_taskflow():
                 departures_all.extend(departures_data)
             else:
                 print(f"Error fetching data for airport {airport}: {r.status_code} - {r.text}")
+
+            time.sleep(3)  # Sleep for 3 seconds to avoid hitting the rate limit
 
 
         return departures_all
@@ -118,6 +122,7 @@ def pipeline_taskflow():
                     "estArrivalAirportVertDistance" INT,
                     "departureAirportCandidatesCount" INT,
                     "arrivalAirportCandidatesCount" INT,
+                    "raw_updated_at" TIMESTAMPTZ NOT NULL DEFAULT now(),
                     PRIMARY KEY ("icao24","firstSeen")
                 );
             """)
@@ -154,7 +159,8 @@ def pipeline_taskflow():
             "lastSeen" = EXCLUDED."lastSeen",
             "estArrivalAirport" = EXCLUDED."estArrivalAirport",
             "estArrivalAirportHorizDistance" = EXCLUDED."estArrivalAirportHorizDistance",
-            "estArrivalAirportVertDistance" = EXCLUDED."estArrivalAirportVertDistance";
+            "estArrivalAirportVertDistance" = EXCLUDED."estArrivalAirportVertDistance",
+            "raw_updated_at" = EXCLUDED."raw_updated_at";
             """ 
 
             for item in arrivals_all:
@@ -170,7 +176,7 @@ def pipeline_taskflow():
                     "estArrivalAirportHorizDistance": item.get("estArrivalAirportHorizDistance"),
                     "estArrivalAirportVertDistance": item.get("estArrivalAirportVertDistance"),
                     "departureAirportCandidatesCount": item.get("departureAirportCandidatesCount"),
-                    "arrivalAirportCandidatesCount": item.get("arrivalAirportCandidatesCount"),
+                    "arrivalAirportCandidatesCount": item.get("arrivalAirportCandidatesCount")
                 }
                 cur.execute(insert_sql, params)
 
@@ -188,6 +194,8 @@ def pipeline_taskflow():
                 conn.close()
                 print("PostgreSQL connection closed.")
 
+
+    @task()
     def load_departure_data(departures_all: list[dict]) -> None:
         import psycopg2
 
@@ -219,6 +227,7 @@ def pipeline_taskflow():
                     "estArrivalAirportVertDistance" INT,
                     "departureAirportCandidatesCount" INT,
                     "arrivalAirportCandidatesCount" INT,
+                    "raw_updated_at" TIMESTAMPTZ NOT NULL DEFAULT now(),
                     PRIMARY KEY ("icao24","firstSeen")
                 );
             """)
@@ -255,7 +264,8 @@ def pipeline_taskflow():
             "lastSeen" = EXCLUDED."lastSeen",
             "estArrivalAirport" = EXCLUDED."estArrivalAirport",
             "estArrivalAirportHorizDistance" = EXCLUDED."estArrivalAirportHorizDistance",
-            "estArrivalAirportVertDistance" = EXCLUDED."estArrivalAirportVertDistance";
+            "estArrivalAirportVertDistance" = EXCLUDED."estArrivalAirportVertDistance",
+            "raw_updated_at" = EXCLUDED."raw_updated_at";
             """
             for item in departures_all:
                 params = {
@@ -287,18 +297,219 @@ def pipeline_taskflow():
             if conn:
                 conn.close()
                 print("PostgreSQL connection closed.")            
-                
+
+    @task()
+    def transform_raw_to_silver() -> None:
+   
+        import psycopg2
+        conn = None
+        cur = None
+
+        conn = psycopg2.connect(
+            host="db",
+            port=5432,
+            dbname="db_flights",
+            user="db_user",
+            password="db_password"
+        )
+        cur = conn.cursor()
+    
+        create_table_sql = """
+            CREATE SCHEMA IF NOT EXISTS dev;
+    
+            CREATE TABLE IF NOT EXISTS dev.silver_arrivals (
+                "icao24" TEXT NOT NULL,
+                "callsign" TEXT,
+                "airline_code" TEXT,
+                "first_seen" TIMESTAMPTZ NOT NULL,
+                "last_seen" TIMESTAMPTZ,
+                "departure_airport" TEXT,
+                "arrival_airport" TEXT,
+                "flight_duration_seconds" BIGINT,
+                "source_updated_at" TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY ("icao24", "first_seen")
+            );
+    
+            CREATE TABLE IF NOT EXISTS dev.silver_departures (
+                "icao24" TEXT NOT NULL,
+                "callsign" TEXT,
+                "airline_code" TEXT,
+                "first_seen" TIMESTAMPTZ NOT NULL,
+                "last_seen" TIMESTAMPTZ,
+                "departure_airport" TEXT,
+                "arrival_airport" TEXT,
+                "flight_duration_seconds" BIGINT,
+                "source_updated_at" TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY ("icao24", "first_seen")
+            );
+        """
+    
+        def upsert_silver(raw_table: str, silver_table: str) -> str:
+            return f"""
+                INSERT INTO {silver_table} AS target (
+                    "icao24",
+                    "callsign",
+                    "airline_code",
+                    "first_seen",
+                    "last_seen",
+                    "departure_airport",
+                    "arrival_airport",
+                    "flight_duration_seconds",
+                    "source_updated_at"
+                )
+                SELECT
+                    raw."icao24",
+                    NULLIF(upper(btrim(raw."callsign")), '') AS "callsign",
+                    SUBSTRING(NULLIF(upper(btrim(raw."callsign")), ''), 1, 3) AS "airline_code",
+                    to_timestamp(raw."firstSeen") AS "first_seen",
+                    to_timestamp(raw."lastSeen") AS "last_seen",
+                    NULLIF(upper(btrim(raw."estDepartureAirport")), '') AS "departure_airport",
+                    NULLIF(upper(btrim(raw."estArrivalAirport")), '') AS "arrival_airport",
+                    CASE
+                        WHEN raw."lastSeen" >= raw."firstSeen"
+                        THEN raw."lastSeen" - raw."firstSeen"
+                    END AS "flight_duration_seconds",
+                    raw."raw_updated_at" AS "source_updated_at"
+                FROM {raw_table} AS raw
+                LEFT JOIN {silver_table} AS existing
+                    ON existing."icao24" = raw."icao24"
+                   AND existing."first_seen" = to_timestamp(raw."firstSeen")
+                WHERE existing."icao24" IS NULL
+                   OR raw."raw_updated_at" > existing."source_updated_at"
+                ON CONFLICT ("icao24", "first_seen") DO UPDATE SET
+                    "callsign" = EXCLUDED."callsign",
+                    "airline_code" = EXCLUDED."airline_code",
+                    "last_seen" = EXCLUDED."last_seen",
+                    "departure_airport" = EXCLUDED."departure_airport",
+                    "arrival_airport" = EXCLUDED."arrival_airport",
+                    "flight_duration_seconds" =
+                        EXCLUDED."flight_duration_seconds",
+                    "source_updated_at" = EXCLUDED."source_updated_at"
+                WHERE EXCLUDED."source_updated_at" > target."source_updated_at";
+            """
+    
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(create_table_sql)
+
+                    for raw_table, silver_table in (
+                        ("dev.raw_arrivals", "dev.silver_arrivals"),
+                        ("dev.raw_departures", "dev.silver_departures"),
+                    ):
+                        cur.execute(upsert_silver(raw_table, silver_table))
+        finally:
+            conn.close()
+
+    @task()
+    def transform_silver_to_gold() -> None:
+        import psycopg2
+        conn = None
+        cur = None
+
+        
+        try:
+            conn = psycopg2.connect(
+                host="db",
+                port=5432,
+                dbname="db_flights",
+                user="db_user",
+                password="db_password"
+            )
+            cur = conn.cursor()
+
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                    CREATE SCHEMA IF NOT EXISTS dev;
+
+                    CREATE TABLE IF NOT EXISTS dev.gold_airport_daily (
+                        "report_date" DATE NOT NULL,
+                        "airport" TEXT NOT NULL,
+                        "direction" TEXT NOT NULL
+                            CHECK ("direction" IN ('arrival', 'departure')),
+                        "airline_code" TEXT NOT NULL,
+                        "flight_count" BIGINT NOT NULL,
+                        "avg_duration_seconds" NUMERIC(12, 2),
+                        "max_duration_seconds" BIGINT,
+                        "source_updated_at" TIMESTAMPTZ NOT NULL,
+                        PRIMARY KEY (
+                            "report_date",
+                            "airport",
+                            "direction",
+                            "airline_code"
+                        )
+                    );
+                    """)
+
+                    cur.execute("""
+                    TRUNCATE TABLE dev.gold_airport_daily;
+
+                    WITH flight_events AS (
+                        SELECT
+                            (first_seen AT TIME ZONE 'Europe/Paris')::date
+                                AS report_date,
+                            arrival_airport AS airport,
+                            'arrival'::text AS direction,
+                            COALESCE(airline_code, 'UNKNOWN') AS airline_code,
+                            flight_duration_seconds,
+                            source_updated_at
+                        FROM dev.silver_arrivals
+                        WHERE arrival_airport IS NOT NULL
+
+                        UNION ALL
+
+                        SELECT
+                            (first_seen AT TIME ZONE 'Europe/Paris')::date
+                                AS report_date,
+                            departure_airport AS airport,
+                            'departure'::text AS direction,
+                            COALESCE(airline_code, 'UNKNOWN') AS airline_code,
+                            flight_duration_seconds,
+                            source_updated_at
+                        FROM dev.silver_departures
+                        WHERE departure_airport IS NOT NULL
+                    )
+                    INSERT INTO dev.gold_airport_daily (
+                        "report_date",
+                        "airport",
+                        "direction",
+                        "airline_code",
+                        "flight_count",
+                        "avg_duration_seconds",
+                        "max_duration_seconds",
+                        "source_updated_at"
+                    )
+                    SELECT
+                        report_date,
+                        airport,
+                        direction,
+                        airline_code,
+                        COUNT(*) AS flight_count,
+                        ROUND(AVG(flight_duration_seconds)::numeric, 2)
+                            AS avg_duration_seconds,
+                        MAX(flight_duration_seconds) AS max_duration_seconds,
+                        MAX(source_updated_at) AS source_updated_at
+                    FROM flight_events
+                    GROUP BY
+                        report_date,
+                        airport,
+                        direction,
+                        airline_code;
+                    """)
+        finally:
+            if conn is not None:
+                conn.close()
 
 
-        pass # Implement the logic to load departure data into the database    
-            
-    #arrivals_all = extract_arrival_data_api(airports, startTime, endTime)
-    #departures_all = extract_departure_data_api(airports, startTime, endTime)
-    airports = ["LFPG"]
-    # "LFPO", "LFBO", "LFLL", "LFML", "LFMN", "LFMT", 
-    # "LFMV", "LFBD", "LFBD", "LFBZ", "LFBH", "LFBK", "LFBL", 
-    # "LFBM", "LFBN", "LFBO", "LFBP", "LFBQ", "LFBR", "LFBS", 
-    # "LFBT", "LFBU", "LFBV", "LFBW", "LFBX", "LFBY"]
+
+
+
+    airports = ["LFPG",
+     "LFPO", "LFBO", "LFLL", "LFML", "LFMN", "LFMT", 
+     "LFMV", "LFBD", "LFBD", "LFBZ", "LFBH", "LFBK", "LFBL", 
+     "LFBM", "LFBN", "LFBO", "LFBP", "LFBQ", "LFBR", "LFBS", 
+     "LFBT", "LFBU", "LFBV", "LFBW", "LFBX", "LFBY"]
         
     prev_day = pendulum.yesterday('Europe/Paris')
     prev_day_end = prev_day.end_of('day')
@@ -309,10 +520,17 @@ def pipeline_taskflow():
     arrivals = extract_arrival_data_api(airports, startTime, endTime)
     departures = extract_departure_data_api(airports, startTime, endTime)
 
-    load_arrival_data(arrivals_all=arrivals)  # type: ignore[arg-type]
+    arrival_load = load_arrival_data(arrivals_all=arrivals)  # type: ignore[arg-type]
 
-    load_departure_data(departures_all=departures)  # type: ignore[arg-type]
+    departure_load = load_departure_data(departures_all=departures)  # type: ignore[arg-type]
     # Equivalent dependency chain:
+    silver_transform = transform_raw_to_silver()  # type: ignore[arg-type]
+
+    arrival_load.set_downstream(silver_transform)  # Ensure that the transformation runs after the arrival load
+    departure_load.set_downstream(silver_transform)  # Ensure that the transformation runs after the departure load
+
+    silver_transform.set_downstream(transform_silver_to_gold())  # Ensure that the gold transformation runs after the silver transformation 
+
 
 
 pipeline_taskflow()
